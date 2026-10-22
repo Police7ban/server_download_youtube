@@ -1,5 +1,6 @@
-
 import os
+import shutil
+import tempfile
 from urllib.parse import urlparse
 
 from flask import Flask, request, jsonify, abort
@@ -16,24 +17,11 @@ def check_key():
         abort(401)
 
 
-def ydl_options():
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "socket_timeout": 20,
-    }
-
-    if os.path.isfile(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
-
-    return opts
-
-
 def valid_youtube_url(url):
     try:
         p = urlparse(url)
         host = (p.hostname or "").lower()
+
         return (
             p.scheme == "https"
             and host in {
@@ -48,17 +36,44 @@ def valid_youtube_url(url):
         return False
 
 
+def ydl_options():
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 20,
+    }
+
+    if os.path.isfile(COOKIES_FILE) and os.access(
+        COOKIES_FILE, os.R_OK
+    ):
+        # Render Secret Files are read-only.
+        # Copy to a writable temporary path for yt-dlp if needed.
+        temp_cookie = os.path.join(
+            tempfile.gettempdir(), "youtube_api_cookies.txt"
+        )
+
+        try:
+            shutil.copyfile(COOKIES_FILE, temp_cookie)
+            opts["cookiefile"] = temp_cookie
+        except OSError:
+            # Fall back to reading the original file.
+            opts["cookiefile"] = COOKIES_FILE
+
+    return opts
+
+
 def extract_video(url):
     if not valid_youtube_url(url):
         raise ValueError("Invalid YouTube URL")
 
     with yt_dlp.YoutubeDL(ydl_options()) as ydl:
-        info = ydl.extract_info(url, download=False)
+        video = ydl.extract_info(url, download=False)
 
-    if not info or info.get("_type") == "playlist":
+    if not video or video.get("_type") == "playlist":
         raise ValueError("Please provide a single video URL")
 
-    return info
+    return video
 
 
 def public_format(f):
@@ -82,7 +97,7 @@ def home():
     return jsonify({
         "status": "ok",
         "service": "YouTube Media API",
-        "endpoints": ["/info", "/download"]
+        "endpoints": ["/info", "/download"],
     })
 
 
@@ -104,7 +119,6 @@ def info():
             if not f.get("format_id") or not f.get("url"):
                 continue
 
-            # Return formats that contain at least video or audio.
             if f.get("vcodec") == "none" and f.get("acodec") == "none":
                 continue
 
@@ -121,6 +135,7 @@ def info():
         })
 
     except Exception as e:
+        app.logger.exception("Video info extraction failed")
         return jsonify({"error": str(e)[:400]}), 502
 
 
@@ -156,12 +171,10 @@ def download():
                 "error": "Format unavailable; call /info again"
             }), 404
 
-        direct_url = selected["url"]
-
         return jsonify({
             "title": video.get("title"),
             "format": public_format(selected),
-            "direct_url": direct_url,
+            "direct_url": selected["url"],
             "http_headers": selected.get("http_headers", {}),
             "expires_note": (
                 "The media URL may expire. Request a new URL through /download."
@@ -169,11 +182,12 @@ def download():
         })
 
     except Exception as e:
+        app.logger.exception("Video URL extraction failed")
         return jsonify({"error": str(e)[:400]}), 502
 
 
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000))
+        port=int(os.environ.get("PORT", 5000)),
     )
