@@ -50,6 +50,7 @@ def valid_youtube_url(url):
 
 
 
+
 def make_ydl_options():
     return {
         "quiet": True,
@@ -58,6 +59,8 @@ def make_ydl_options():
         "socket_timeout": 30,
         "retries": 2,
         "extractor_retries": 2,
+        "ignore_no_formats_error": True,
+        "format": "best",
         "extractor_args": {
             "youtube": {
                 "player_client": ["web"]
