@@ -1,10 +1,14 @@
+
 import os
-import requests
-from flask import Flask, request, jsonify, Response, abort
+from urllib.parse import urlparse
+
+from flask import Flask, request, jsonify, abort
 import yt_dlp
 
 app = Flask(__name__)
+
 API_KEY = os.environ.get("API_KEY", "")
+COOKIES_FILE = "/etc/secrets/cookies.txt"
 
 
 def check_key():
@@ -12,114 +16,164 @@ def check_key():
         abort(401)
 
 
-def base_opts():
-    o = {"quiet": True, "no_warnings": True, "skip_download": True}
-    for p in ("/etc/secrets/cookies.txt", "cookies.txt"):
-        if os.path.exists(p):
-            o["cookiefile"] = p
-            break
-    return o
+def ydl_options():
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 20,
+    }
+
+    if os.path.isfile(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+
+    return opts
 
 
-def best_thumb(entry, vid):
-    thumbs = entry.get("thumbnails") or []
-    if thumbs and thumbs[-1].get("url"):
-        return thumbs[-1]["url"]
-    if entry.get("thumbnail"):
-        return entry["thumbnail"]
-    return f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+def valid_youtube_url(url):
+    try:
+        p = urlparse(url)
+        host = (p.hostname or "").lower()
+        return (
+            p.scheme == "https"
+            and host in {
+                "youtube.com",
+                "www.youtube.com",
+                "m.youtube.com",
+                "youtu.be",
+                "music.youtube.com",
+            }
+        )
+    except Exception:
+        return False
+
+
+def extract_video(url):
+    if not valid_youtube_url(url):
+        raise ValueError("Invalid YouTube URL")
+
+    with yt_dlp.YoutubeDL(ydl_options()) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    if not info or info.get("_type") == "playlist":
+        raise ValueError("Please provide a single video URL")
+
+    return info
+
+
+def public_format(f):
+    return {
+        "format_id": f.get("format_id"),
+        "ext": f.get("ext"),
+        "height": f.get("height"),
+        "width": f.get("width"),
+        "fps": f.get("fps"),
+        "filesize": f.get("filesize") or f.get("filesize_approx"),
+        "vcodec": f.get("vcodec"),
+        "acodec": f.get("acodec"),
+        "has_video": f.get("vcodec") not in (None, "none"),
+        "has_audio": f.get("acodec") not in (None, "none"),
+        "protocol": f.get("protocol"),
+    }
 
 
 @app.route("/")
 def home():
-    return "OK"
+    return jsonify({
+        "status": "ok",
+        "service": "YouTube Media API",
+        "endpoints": ["/info", "/download"]
+    })
 
 
-@app.route("/info", methods=["POST"])
+@app.route("/info", methods=["GET", "POST"])
 def info():
     check_key()
+
     data = request.get_json(silent=True) or {}
-    url = (data.get("url") or "").strip()
-    if not url:
-        return jsonify({"error": "missing url"}), 400
+    url = (data.get("url") or request.args.get("url") or "").strip()
 
-    opts = base_opts()
-    opts["extract_flat"] = "in_playlist"
-    opts["noplaylist"] = False
+    if not url:
+        return jsonify({"error": "Missing url"}), 400
 
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            res = ydl.extract_info(url, download=False)
+        video = extract_video(url)
+        formats = []
 
-        items = []
-        if res.get("_type") == "playlist":
-            for e in res.get("entries") or []:
-                if not e:
-                    continue
-                vid = e.get("id")
-                if not vid:
-                    continue
-                items.append({
-                    "id": vid,
-                    "title": e.get("title") or "Untitled",
-                    "thumbnail": best_thumb(e, vid),
-                    "duration": e.get("duration") or 0,
-                    "url": f"https://www.youtube.com/watch?v={vid}",
-                })
-            return jsonify({
-                "type": "playlist",
-                "title": res.get("title") or "Playlist",
-                "count": len(items),
-                "items": items,
-            })
+        for f in video.get("formats", []):
+            if not f.get("format_id") or not f.get("url"):
+                continue
 
-        vid = res.get("id")
-        items.append({
-            "id": vid,
-            "title": res.get("title") or "Untitled",
-            "thumbnail": best_thumb(res, vid),
-            "duration": res.get("duration") or 0,
-            "url": res.get("webpage_url") or url,
+            # Return formats that contain at least video or audio.
+            if f.get("vcodec") == "none" and f.get("acodec") == "none":
+                continue
+
+            formats.append(public_format(f))
+
+        return jsonify({
+            "type": "video",
+            "id": video.get("id"),
+            "title": video.get("title"),
+            "thumbnail": video.get("thumbnail"),
+            "duration": video.get("duration"),
+            "webpage_url": video.get("webpage_url"),
+            "formats": formats,
         })
-        return jsonify({"type": "video", "title": res.get("title"), "count": 1, "items": items})
+
     except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 500
+        return jsonify({"error": str(e)[:400]}), 502
 
 
-@app.route("/stream")
-def stream():
-    url = request.args.get("url", "").strip()
-    mode = request.args.get("mode", "audio")
-    key = request.args.get("key", "")
-    if API_KEY and key != API_KEY and request.headers.get("X-API-Key") != API_KEY:
-        abort(401)
-    if not url:
-        return jsonify({"error": "missing url"}), 400
+@app.route("/download", methods=["GET", "POST"])
+def download():
+    check_key()
 
-    opts = base_opts()
-    opts["noplaylist"] = True
-    if mode == "video":
-        opts["format"] = "best[ext=mp4][height<=720]/best[ext=mp4]/best"
-    else:
-        opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or request.args.get("url") or "").strip()
+    format_id = str(
+        data.get("format_id") or request.args.get("format_id") or ""
+    ).strip()
+
+    if not url or not format_id:
+        return jsonify({
+            "error": "Provide url and format_id"
+        }), 400
 
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            res = ydl.extract_info(url, download=False)
-        direct = res["url"]
-        headers = dict(res.get("http_headers") or {})
-        if request.headers.get("Range"):
-            headers["Range"] = request.headers["Range"]
+        video = extract_video(url)
 
-        r = requests.get(direct, headers=headers, stream=True, timeout=30)
-        resp = Response(r.iter_content(chunk_size=64 * 1024), status=r.status_code)
-        for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
-            if h in r.headers:
-                resp.headers[h] = r.headers[h]
-        return resp
+        selected = next(
+            (
+                f for f in video.get("formats", [])
+                if str(f.get("format_id")) == format_id
+                and f.get("url")
+            ),
+            None,
+        )
+
+        if not selected:
+            return jsonify({
+                "error": "Format unavailable; call /info again"
+            }), 404
+
+        direct_url = selected["url"]
+
+        return jsonify({
+            "title": video.get("title"),
+            "format": public_format(selected),
+            "direct_url": direct_url,
+            "http_headers": selected.get("http_headers", {}),
+            "expires_note": (
+                "The media URL may expire. Request a new URL through /download."
+            ),
+        })
+
     except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 500
+        return jsonify({"error": str(e)[:400]}), 502
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000))
+    )
