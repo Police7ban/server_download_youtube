@@ -4,7 +4,7 @@ from flask import Flask, request, jsonify, Response, abort
 import yt_dlp
 
 app = Flask(__name__)
-API_KEY = os.environ.get("API_KEY", "")  # اختياري: ضيفه في Environment على Render
+API_KEY = os.environ.get("API_KEY", "")
 
 
 def check_key():
@@ -14,8 +14,10 @@ def check_key():
 
 def base_opts():
     o = {"quiet": True, "no_warnings": True, "skip_download": True}
-    if os.path.exists("cookies.txt"):
-        o["cookiefile"] = "cookies.txt"
+    for p in ("/etc/secrets/cookies.txt", "cookies.txt"):
+        if os.path.exists(p):
+            o["cookiefile"] = p
+            break
     return o
 
 
@@ -86,9 +88,8 @@ def info():
 
 @app.route("/stream")
 def stream():
-    check_key()
     url = request.args.get("url", "").strip()
-    mode = request.args.get("mode", "audio")  # audio | video
+    mode = request.args.get("mode", "audio")
     key = request.args.get("key", "")
     if API_KEY and key != API_KEY and request.headers.get("X-API-Key") != API_KEY:
         abort(401)
