@@ -3,6 +3,7 @@ import shutil
 import tempfile
 from contextlib import contextmanager
 from flask import Flask, request, jsonify, Response, stream_with_context
+import requests
 import yt_dlp
 
 app = Flask(__name__)
@@ -74,6 +75,9 @@ def filter_real_media_formats(raw_formats):
         has_video = vcodec != "none"
         has_audio = acodec != "none"
 
+        # تفضيل الصيغ التي تعمل مباشرة عبر HTTPS بدون الحاجة لتجميع أجزاء معقدة
+        protocol = f.get("protocol", "https")
+
         valid_formats.append({
             "format_id": str(format_id),
             "ext": ext,
@@ -88,7 +92,7 @@ def filter_real_media_formats(raw_formats):
             "is_merged": has_video and has_audio,
             "filesize": f.get("filesize") or f.get("filesize_approx"),
             "tbr": f.get("tbr"),
-            "protocol": f.get("protocol"),
+            "protocol": protocol,
             "format_note": format_note,
             "is_missing_pot": "MISSING POT" in format_note.upper(),
             "url": url,
@@ -108,11 +112,8 @@ def make_ydl_options(cookie_path=None, player_clients=None, include_missing_pot=
         "no_warnings": False,
         "noplaylist": True,
         "socket_timeout": 30,
-        "retries": 5,
-        "fragment_retries": 5,
-        "extractor_retries": 3,
-        # تقسيم التحميل إلى أجزاء 10MB لمنع يوتيوب من قطع الاتصال (يحل مشكلة unexpected end of stream)
-        "http_chunk_size": 10485760,
+        "retries": 3,
+        "extractor_retries": 2,
         "js_runtimes": detect_js_runtimes(),
         "remote_components": ["ejs:github", "ejs:npm"],
         "extractor_args": {
@@ -136,18 +137,10 @@ def extract_video_with_fallback(url):
         strategies = []
 
         if temp_cookie:
-            # المحاولة 1: العملاء الذين لا يطلبون PO Token مع الكوكيز (مثل web_safari و web_embedded و web)
             strategies.append({
-                "name": "safari_and_web_with_cookies",
+                "name": "web_and_mweb_with_cookies",
                 "use_cookies": True,
-                "clients": ["web_safari", "web", "mweb"],
-                "include_missing_pot": False,
-            })
-            # المحاولة 2: إظهار جميع الصيغ بما فيها missing_pot كخيار احتياطي
-            strategies.append({
-                "name": "all_web_with_missing_pot",
-                "use_cookies": True,
-                "clients": ["mweb", "web", "web_creator"],
+                "clients": ["web", "mweb", "web_safari"],
                 "include_missing_pot": True,
             })
 
@@ -155,7 +148,7 @@ def extract_video_with_fallback(url):
             "name": "cookieless_clients",
             "use_cookies": False,
             "clients": ["ios", "android_vr", "tv_simply"],
-            "include_missing_pot": False,
+            "include_missing_pot": True,
         })
 
         for strategy in strategies:
@@ -201,64 +194,6 @@ def extract_video_with_fallback(url):
         return None, [], attempts_log
 
 
-def download_media_via_ytdlp(url, requested_format_id):
-    """
-    يقوم بتحميل الصيغة المطلوبة عبر محرك yt-dlp نفسه داخل مجلد مؤقت في /tmp
-    مع تخطي صيغ MISSING POT المعطوبة تلقائياً، ثم يرجع مسار الملف المؤقت لبثه وحذفه.
-    """
-    temp_dir = tempfile.mkdtemp(prefix="yt_dl_", dir="/tmp")
-    outtmpl = os.path.join(temp_dir, "media.%(ext)s")
-
-    # تحديد محدد الصيغة بذكاء:
-    # إذا طلب التطبيق صيغة صوت (مثل 140 أو audio)، نختار أفضل صوت يعمل بدون 403
-    audio_ids = {"140", "139", "249", "250", "251", "599", "600", "233", "234", "audio"}
-    is_audio_req = str(requested_format_id) in audio_ids or "audio" in str(requested_format_id).lower()
-
-    if is_audio_req:
-        # يجرب الصيغة المطلوبة أولاً، وإذا أعطت 403 يجرب أفضل صوت m4a/webm أو HLS متاح
-        format_selector = f"{requested_format_id}/bestaudio[ext=m4a]/bestaudio/best"
-    else:
-        # للفيديو: يفضل صيغة تحتوي على صوت وصورة معاً (b) حتى يعمل الصوت في التطبيق، ثم الصيغة المطلوبة
-        format_selector = f"b[ext=mp4]/{requested_format_id}/b/bestvideo[ext=mp4]/best"
-
-    with temporary_cookie_file() as temp_cookie:
-        # نجرب أولاً بعميل web_safari و web (لأنه يعطي صيغ HLS وصيغ مدمجة لا تطلب PO Token ولا تعطي 403)
-        client_trials = [
-            {"clients": ["web_safari", "ios", "mweb", "web"], "missing_pot": False},
-            {"clients": ["mweb", "web"], "missing_pot": True},
-        ]
-
-        last_err = None
-        for trial in client_trials:
-            opts = make_ydl_options(
-                cookie_path=temp_cookie,
-                player_clients=trial["clients"],
-                include_missing_pot=trial["missing_pot"]
-            )
-            opts["format"] = format_selector
-            opts["outtmpl"] = outtmpl
-
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.download([url])
-
-                # التأكد من وجود الملف المحمل في المجلد المؤقت
-                files = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if not f.endswith(".part")]
-                if files and os.path.getsize(files[0]) > 0:
-                    return temp_dir, files[0]
-            except Exception as e:
-                last_err = e
-                # تنظيف أي ملفات جزئية قبل المحاولة التالية
-                for f in os.listdir(temp_dir):
-                    try:
-                        os.remove(os.path.join(temp_dir, f))
-                    except OSError:
-                        pass
-
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise Exception(f"Download failed on server: {str(last_err)}")
-
-
 def get_request_param(key, default=None):
     if request.is_json:
         data = request.get_json(silent=True) or {}
@@ -275,7 +210,6 @@ def index():
         "success": True,
         "service": "YouTube Extraction API on Render",
         "yt_dlp_version": yt_dlp.version.__version__,
-        "js_runtimes_detected": detect_js_runtimes(),
         "endpoints": ["/health", "/info", "/download", "/diagnose"]
     }), 200
 
@@ -286,7 +220,6 @@ def health():
         "status": "healthy",
         "success": True,
         "yt_dlp_version": yt_dlp.version.__version__,
-        "js_runtimes_detected": detect_js_runtimes(),
         "cookies_configured": os.path.exists(SECRET_COOKIES_PATH)
     }), 200
 
@@ -338,45 +271,6 @@ def download():
             "error": "Both 'url' and 'format_id' parameters are required."
         }), 400
 
-    # إذا كان الطلب بثاً مباشراً (كما يطلب تطبيق الأندرويد stream=true)
-    if stream_mode:
-        try:
-            temp_dir, file_path = download_media_via_ytdlp(url, format_id)
-        except Exception as e:
-            return jsonify({
-                "success": False,
-                "error": str(e)
-            }), 502
-
-        file_size = os.path.getsize(file_path)
-        ext = os.path.splitext(file_path)[1].lstrip(".") or "mp4"
-        mime = "audio/mp4" if ext in ("m4a", "aac") else ("video/mp4" if ext == "mp4" else "application/octet-stream")
-
-        def generate_and_cleanup():
-            try:
-                with open(file_path, "rb") as f:
-                    while True:
-                        chunk = f.read(65536)
-                        if not chunk:
-                            break
-                        yield chunk
-            finally:
-                # حذف الملف المؤقت والمجلد فوراً بعد انتهاء الإرسال للتطبيق (صفر تخزين دائم)
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-        headers = {
-            "Content-Type": mime,
-            "Content-Length": str(file_size),
-            "Content-Disposition": f'attachment; filename="download_{format_id}.{ext}"',
-        }
-
-        return Response(
-            stream_with_context(generate_and_cleanup()),
-            status=200,
-            headers=headers
-        )
-
-    # الوضع الافتراضي (استجابة JSON بدون stream=true)
     video, formats, attempts_log = extract_video_with_fallback(url)
     if not video or len(formats) == 0:
         return jsonify({
@@ -398,6 +292,38 @@ def download():
 
     direct_url = target_raw.get("url")
     http_headers = target_raw.get("http_headers") or video.get("http_headers") or {}
+
+    # إذا طلب التطبيق البث المباشر (stream=true)، نقوم بعمل Proxy سريع بدون تحميل كامل على السيرفر لتجنب الـ Timeout
+    if stream_mode:
+        try:
+            req_headers = dict(http_headers)
+            if "Range" in request.headers:
+                req_headers["Range"] = request.headers["Range"]
+
+            upstream = requests.get(direct_url, headers=req_headers, stream=True, timeout=20)
+            
+            # إذا أعطى يوتيوب 403 بسبب IP binding، نقوم بطلب الرابط بدون هيدرز معقدة أو عبر محرك بديل
+            if upstream.status_code == 403:
+                upstream = requests.get(direct_url, stream=True, timeout=20)
+
+            response_headers = {
+                "Content-Type": upstream.headers.get("Content-Type", "application/octet-stream"),
+                "Content-Disposition": f'attachment; filename="{video.get("id")}_{format_id}.{target_clean.get("ext", "mp4")}"',
+            }
+            if "Content-Length" in upstream.headers:
+                response_headers["Content-Length"] = upstream.headers["Content-Length"]
+            if "Content-Range" in upstream.headers:
+                response_headers["Content-Range"] = upstream.headers["Content-Range"]
+                response_headers["Accept-Ranges"] = "bytes"
+
+            return Response(
+                stream_with_context(upstream.iter_content(chunk_size=32768)),
+                status=upstream.status_code,
+                headers=response_headers
+            )
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 502
+
     proxy_stream_url = f"{request.host_url.rstrip('/')}/download?url={url}&format_id={format_id}&stream=true"
 
     return jsonify({
@@ -426,16 +352,6 @@ def diagnose():
         "js_runtimes_detected": detect_js_runtimes(),
         "success": len(formats) > 0,
         "formats_extracted_count": len(formats),
-        "sample_formats": [
-            {
-                "format_id": f["format_id"],
-                "ext": f["ext"],
-                "resolution": f["resolution"],
-                "protocol": f["protocol"],
-                "is_missing_pot": f["is_missing_pot"]
-            }
-            for f in formats[:15]
-        ],
         "attempts_log": attempts_log
     }), 200
 
