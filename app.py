@@ -48,6 +48,7 @@ def valid_youtube_url(url):
         return False
 
 
+
 def make_ydl_options():
     return {
         "quiet": True,
@@ -56,7 +57,12 @@ def make_ydl_options():
         "socket_timeout": 30,
         "retries": 2,
         "extractor_retries": 2,
-        # Do not force a format when extracting video information.
+        "ignore_no_formats_error": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["tv_simply", "web"]
+            }
+        },
     }
 
 
