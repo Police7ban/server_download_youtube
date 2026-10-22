@@ -1,7 +1,6 @@
 import os
 import shutil
 import tempfile
-import traceback
 from contextlib import contextmanager
 from flask import Flask, request, jsonify, Response, stream_with_context
 import requests
@@ -9,21 +8,17 @@ import yt_dlp
 
 app = Flask(__name__)
 
-# المسار الافتراضي لملف الكوكيز في Render Secret Files
 SECRET_COOKIES_PATH = os.environ.get("COOKIES_FILE_PATH", "/etc/secrets/cookies.txt")
 
 
 class LoggerCollector:
     """التقاط رسائل وتحذيرات yt-dlp لتحليلها دون كشف أي بيانات حساسة."""
     def __init__(self):
-        self.debugs = []
         self.warnings = []
         self.errors = []
 
     def debug(self, msg):
-        # نحتفظ فقط بالرسائل المتعلقة باختيار العميل أو محرك JS
-        if any(k in msg for k in ["Extracting URL", "Downloading", "player_client", "JS", " formats"]):
-            self.debugs.append(msg)
+        pass
 
     def warning(self, msg):
         self.warnings.append(msg)
@@ -34,10 +29,7 @@ class LoggerCollector:
 
 @contextmanager
 def temporary_cookie_file():
-    """
-    ينسخ ملف الكوكيز من /etc/secrets/cookies.txt (Read-only) إلى ملف مؤقت في /tmp
-    ويضمن حذفه فوراً بعد انتهاء الطلب حتى لو حدث خطأ.
-    """
+    """نسخ ملف الكوكيز من /etc/secrets/cookies.txt إلى /tmp وحذفه فور انتهاء الطلب."""
     if not os.path.exists(SECRET_COOKIES_PATH):
         yield None
         return
@@ -55,55 +47,24 @@ def temporary_cookie_file():
                 pass
 
 
-def inspect_cookie_file_safely(path):
+def detect_js_runtimes():
     """
-    يفحص وجود وصحة هيكل ملف الكوكيز وأسماء الكوكيز الأساسية ليوتيوب
-    دون قراءة أو طباعة أي قيم سرية نهائياً.
+    يكتشف محركات JavaScript المثبتة على سيرفر Render (مثل Node.js أو Deno)
+    ويجهزها بالصيغة التي يتطلبها yt-dlp 2026 لحل تحدي n-challenge.
     """
-    report = {
-        "exists": False,
-        "readable": False,
-        "has_netscape_header": False,
-        "total_cookie_lines": 0,
-        "youtube_auth_keys_present": [],
-    }
-    if not path or not os.path.exists(path):
-        return report
-
-    report["exists"] = True
-    important_keys = {
-        "SID", "HSID", "SSID", "APISID", "SAPISID",
-        "__Secure-1PSID", "__Secure-3PSID", "LOGIN_INFO", "__Secure-1PSIDTS"
-    }
-    found_keys = set()
-
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for i, line in enumerate(f):
-                stripped = line.strip()
-                if i == 0 and ("Netscape" in stripped or "HTTP Cookie File" in stripped):
-                    report["has_netscape_header"] = True
-                if not stripped or stripped.startswith("#"):
-                    continue
-                parts = stripped.split("\t")
-                if len(parts) >= 7:
-                    report["total_cookie_lines"] += 1
-                    cookie_name = parts[5].strip()
-                    if cookie_name in important_keys:
-                        found_keys.add(cookie_name)
-        report["readable"] = True
-        report["youtube_auth_keys_present"] = sorted(list(found_keys))
-    except Exception as e:
-        report["error"] = str(e)
-
-    return report
+    runtimes = {}
+    for rt in ("deno", "node", "bun", "qjs"):
+        path = shutil.which(rt)
+        if path:
+            runtimes[rt] = {"path": path}
+    # إذا لم يعثر shutil.which، نفعل node و deno افتراضياً
+    if not runtimes:
+        runtimes = {"node": {}, "deno": {}}
+    return runtimes
 
 
 def filter_real_media_formats(raw_formats):
-    """
-    تصفية الصيغ لاستبعاد صور الـ Storyboards (mhtml) والصيغ التي لا تملك رابطاً،
-    مع الحفاظ على صيغ الصوت فقط (Audio only) والفيديو فقط (Video only) والصيغ المدمجة.
-    """
+    """تصفية الصيغ لاستبعاد Storyboards والاحتفاظ بجميع صيغ الفيديو والصوت (HTTPS + HLS)."""
     valid_formats = []
     for f in raw_formats or []:
         format_id = f.get("format_id")
@@ -115,7 +76,6 @@ def filter_real_media_formats(raw_formats):
         acodec = f.get("acodec") or "none"
         ext = f.get("ext") or ""
 
-        # استبعاد Storyboards والصور
         if (vcodec == "none" and acodec == "none") or ext == "mhtml" or str(format_id).startswith("sb"):
             continue
 
@@ -143,12 +103,18 @@ def filter_real_media_formats(raw_formats):
     return valid_formats
 
 
-def make_ydl_options(cookie_path=None, player_clients=None, logger=None):
+def make_ydl_options(cookie_path=None, player_clients=None, include_missing_pot=True, logger=None):
     """
-    بناء إعدادات yt-dlp بشكل نظيف.
-    - لا نستخدم ignore_no_formats_error حتى لا نخفي الفشل.
-    - لا نفرض format='best' حتى لا نمنع استخراج كافة الصيغ أو نفشل عند غياب صيغة مدمجة.
+    إعداد yt-dlp مع:
+    1. تفعيل js_runtimes (Node.js / Deno) لحل n-challenge.
+    2. تفعيل formats=missing_pot لعدم إسقاط صيغ HTTPS مثل 140 و 137 على Render.
     """
+    youtube_args = {}
+    if player_clients:
+        youtube_args["player_client"] = player_clients
+    if include_missing_pot:
+        youtube_args["formats"] = ["missing_pot"]
+
     opts = {
         "quiet": True,
         "no_warnings": False,
@@ -156,8 +122,13 @@ def make_ydl_options(cookie_path=None, player_clients=None, logger=None):
         "socket_timeout": 30,
         "retries": 2,
         "extractor_retries": 2,
-        # السماح بتحميل مكونات فك التشفير البرمجية (EJS) عند الحاجة
-        "remote_components": ["ejs:github"],
+        # تفعيل محركات JS المثبتة على السيرفر (Node مثبت مسبقاً على Render)
+        "js_runtimes": detect_js_runtimes(),
+        # السماح بتحميل سكربتات التحدي كخيار احتياطي إضافي بجانب حزمة yt-dlp-ejs
+        "remote_components": ["ejs:github", "ejs:npm"],
+        "extractor_args": {
+            "youtube": youtube_args
+        }
     }
 
     if logger:
@@ -166,23 +137,15 @@ def make_ydl_options(cookie_path=None, player_clients=None, logger=None):
     if cookie_path:
         opts["cookiefile"] = cookie_path
 
-    if player_clients:
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": player_clients
-            }
-        }
-
     return opts
 
 
 def extract_video_with_fallback(url):
     """
-    يستخدم استراتيجية متعدّدة المراحل (Multi-stage Fallback) للتغلب على قيود Render:
-    1. المحاولة الأولى (إذا وجد ملف كوكيز): استخدام العملاء المتوافقين مع الكوكيز (web_creator, tv, mweb, web).
-       ملاحظة: عميل web_creator و tv غالباً ما يتجاوزان قيود PO Token في حال كانت الكوكيز صالحة.
-    2. المحاولة الثانية (بدون كوكيز): في حال كانت الكوكيز منتهية الصلاحية أو مقيدة، نجرب عملاء لا يستخدمون الكوكيز
-       مثل (ios, android_vr, tv_simply).
+    استراتيجية الاستخراج المتدرجة:
+    1. web + mweb مع الكوكيز وتفعيل Node JS Runtime والسماح بصيغ missing_pot (الأعلى نجاحاً).
+    2. web_creator + mweb مع الكوكيز.
+    3. بدون كوكيز في حال تعطل الكوكيز مستقبلاً.
     """
     attempts_log = []
 
@@ -190,21 +153,28 @@ def extract_video_with_fallback(url):
         strategies = []
 
         if temp_cookie:
+            # الاستراتيجية 1: عملاء الويب الرسميون للكوكيز (بدون عميل tv الذي يسبب خطأ Reload)
             strategies.append({
-                "name": "authenticated_clients_with_cookies",
+                "name": "web_and_mweb_with_cookies_and_missing_pot",
                 "use_cookies": True,
-                # هؤلاء العملاء يدعمون الكوكيز رسمياً في yt-dlp ولا يتم تخطيهم
-                "clients": ["tv", "web_creator", "mweb", "web"],
+                "clients": ["mweb", "web"],
+                "include_missing_pot": True,
+            })
+            # الاستراتيجية 2: عميل منشئي المحتوى منفرداً
+            strategies.append({
+                "name": "web_creator_with_cookies",
+                "use_cookies": True,
+                "clients": ["web_creator"],
+                "include_missing_pot": True,
             })
 
+        # الاستراتيجية 3: بدون كوكيز كخط دفاع أخير
         strategies.append({
-            "name": "cookieless_embedded_and_mobile_clients",
+            "name": "cookieless_clients",
             "use_cookies": False,
-            # هؤلاء العملاء يعملون بدون كوكيز فقط
-            "clients": ["ios", "android_vr", "tv_simply", "web_embedded"],
+            "clients": ["ios", "android_vr", "tv_simply"],
+            "include_missing_pot": True,
         })
-
-        last_exception = None
 
         for strategy in strategies:
             logger = LoggerCollector()
@@ -212,6 +182,7 @@ def extract_video_with_fallback(url):
             opts = make_ydl_options(
                 cookie_path=cookie_to_pass,
                 player_clients=strategy["clients"],
+                include_missing_pot=strategy["include_missing_pot"],
                 logger=logger
             )
 
@@ -225,6 +196,7 @@ def extract_video_with_fallback(url):
                         "strategy": strategy["name"],
                         "clients_requested": strategy["clients"],
                         "used_cookies": strategy["use_cookies"],
+                        "js_runtimes_passed": list(opts["js_runtimes"].keys()),
                         "raw_formats_count": len(raw_formats),
                         "valid_media_formats_count": len(clean_formats),
                         "warnings": logger.warnings,
@@ -235,26 +207,21 @@ def extract_video_with_fallback(url):
                         return video_info, clean_formats, attempts_log
 
             except Exception as exc:
-                last_exception = exc
                 attempts_log.append({
                     "strategy": strategy["name"],
                     "clients_requested": strategy["clients"],
                     "used_cookies": strategy["use_cookies"],
+                    "js_runtimes_passed": list(opts["js_runtimes"].keys()),
                     "valid_media_formats_count": 0,
                     "exception": str(exc),
                     "warnings": logger.warnings,
                     "errors": logger.errors,
                 })
 
-        # إذا وصلنا إلى هنا، فهذا يعني أن جميع الاستراتيجيات لم ترجع أي صيغ فيديو/صوت حقيقية
-        error_msg = "Failed to extract any playable audio/video formats across all strategies."
-        if last_exception:
-            error_msg = f"{error_msg} Last error: {str(last_exception)}"
         return None, [], attempts_log
 
 
 def get_request_param(key, default=None):
-    """قراءة الباراميتر سواء أُرسل عبر Query String (GET) أو JSON Body أو Form (POST)."""
     if request.is_json:
         data = request.get_json(silent=True) or {}
         if key in data:
@@ -270,6 +237,7 @@ def index():
         "success": True,
         "service": "YouTube Extraction API on Render",
         "yt_dlp_version": yt_dlp.version.__version__,
+        "js_runtimes_detected": detect_js_runtimes(),
         "endpoints": ["/health", "/info", "/download", "/diagnose"]
     }), 200
 
@@ -280,6 +248,7 @@ def health():
         "status": "healthy",
         "success": True,
         "yt_dlp_version": yt_dlp.version.__version__,
+        "js_runtimes_detected": detect_js_runtimes(),
         "cookies_configured": os.path.exists(SECRET_COOKIES_PATH)
     }), 200
 
@@ -295,7 +264,6 @@ def info():
 
     video, formats, attempts_log = extract_video_with_fallback(url)
 
-    # رفض إرجاع HTTP 200 مضلل إذا كانت الصيغ فارغة
     if not video or len(formats) == 0:
         return jsonify({
             "success": False,
@@ -341,7 +309,6 @@ def download():
             "diagnostics": attempts_log
         }), 502
 
-    # البحث عن الصيغة المطلوبة داخل الصيغ الخام للحصول على http_headers الخاصة بها
     raw_formats = video.get("formats") or []
     target_raw = next((f for f in raw_formats if str(f.get("format_id")) == str(format_id)), None)
     target_clean = next((f for f in formats if str(f.get("format_id")) == str(format_id)), None)
@@ -357,10 +324,8 @@ def download():
     direct_url = target_raw.get("url")
     http_headers = target_raw.get("http_headers") or video.get("http_headers") or {}
 
-    # إذا طلب العميل البث المباشر عبر السيرفر لتجنب حظر الـ IP (403 Forbidden) دون تخزين الملف
     if stream_mode:
         req_headers = dict(http_headers)
-        # تمرير ترويسة Range إذا كان مشغل الفيديو لدى العميل يطلب تقديم/تأخير الفيديو
         if "Range" in request.headers:
             req_headers["Range"] = request.headers["Range"]
 
@@ -381,7 +346,6 @@ def download():
             headers=response_headers
         )
 
-    # الوضع الافتراضي: إرجاع JSON يحتوي على الرابط المباشر والترويسات ورابط البث البديل
     proxy_stream_url = f"{request.host_url.rstrip('/')}/download?url={url}&format_id={format_id}&stream=true"
 
     return jsonify({
@@ -391,92 +355,35 @@ def download():
         "format_id": str(format_id),
         "ext": target_clean.get("ext"),
         "resolution": target_clean.get("resolution"),
+        "protocol": target_clean.get("protocol"),
         "has_video": target_clean.get("has_video"),
         "has_audio": target_clean.get("has_audio"),
         "filesize": target_clean.get("filesize"),
         "direct_url": direct_url,
         "http_headers": http_headers,
-        "proxy_stream_url": proxy_stream_url,
-        "note": "If direct_url returns HTTP 403 on the client due to IP binding, use proxy_stream_url."
+        "proxy_stream_url": proxy_stream_url
     }), 200
 
 
 @app.route("/diagnose", methods=["GET", "POST"])
 def diagnose():
-    """
-    اختبار تشخيصي آمن يفحص كل عميل على حدة، وجود JS Runtime، وصلاحية هيكل الكوكيز
-    دون كشف أي محتوى من ملف الكوكيز.
-    """
     url = get_request_param("url", "https://www.youtube.com/watch?v=Pk1PBxK49_Y")
-
-    # 1. فحص وجود محركات JavaScript في بيئة Render
-    js_runtimes = {
-        "node": shutil.which("node"),
-        "deno": shutil.which("deno"),
-        "bun": shutil.which("bun"),
-        "qjs": shutil.which("qjs"),
-    }
-
-    # 2. فحص آمن لهيكل ملف الكوكيز
-    cookie_inspection = inspect_cookie_file_safely(SECRET_COOKIES_PATH)
-
-    # 3. اختبار العملاء منفردين لمعرفة سلوك كل عميل بدقة
-    test_matrix = [
-        {"label": "tv_with_cookies", "clients": ["tv"], "cookies": True},
-        {"label": "web_creator_with_cookies", "clients": ["web_creator"], "cookies": True},
-        {"label": "mweb_with_cookies", "clients": ["mweb"], "cookies": True},
-        {"label": "ios_without_cookies", "clients": ["ios"], "cookies": False},
-        {"label": "android_vr_without_cookies", "clients": ["android_vr"], "cookies": False},
-        {"label": "tv_simply_without_cookies", "clients": ["tv_simply"], "cookies": False},
-    ]
-
-    matrix_results = []
-    with temporary_cookie_file() as temp_cookie:
-        for case in test_matrix:
-            if case["cookies"] and not temp_cookie:
-                matrix_results.append({
-                    "test": case["label"],
-                    "skipped": "Cookie file not found at /etc/secrets/cookies.txt"
-                })
-                continue
-
-            logger = LoggerCollector()
-            opts = make_ydl_options(
-                cookie_path=temp_cookie if case["cookies"] else None,
-                player_clients=case["clients"],
-                logger=logger
-            )
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info_dict = ydl.extract_info(url, download=False)
-                    raw_f = info_dict.get("formats") or []
-                    valid_f = filter_real_media_formats(raw_f)
-                    matrix_results.append({
-                        "test": case["label"],
-                        "client": case["clients"],
-                        "used_cookies": case["cookies"],
-                        "raw_formats_total": len(raw_f),
-                        "playable_formats_count": len(valid_f),
-                        "sample_format_ids": [f["format_id"] for f in valid_f[:8]],
-                        "warnings": logger.warnings,
-                        "errors": logger.errors,
-                    })
-            except Exception as e:
-                matrix_results.append({
-                    "test": case["label"],
-                    "client": case["clients"],
-                    "used_cookies": case["cookies"],
-                    "playable_formats_count": 0,
-                    "exception": str(e),
-                    "warnings": logger.warnings,
-                    "errors": logger.errors,
-                })
-
+    video, formats, attempts_log = extract_video_with_fallback(url)
     return jsonify({
         "yt_dlp_version": yt_dlp.version.__version__,
-        "js_runtimes_detected": js_runtimes,
-        "cookie_file_check": cookie_inspection,
-        "client_tests": matrix_results
+        "js_runtimes_detected": detect_js_runtimes(),
+        "success": len(formats) > 0,
+        "formats_extracted_count": len(formats),
+        "sample_formats": [
+            {
+                "format_id": f["format_id"],
+                "ext": f["ext"],
+                "resolution": f["resolution"],
+                "protocol": f["protocol"]
+            }
+            for f in formats[:15]
+        ],
+        "attempts_log": attempts_log
     }), 200
 
 
