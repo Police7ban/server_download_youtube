@@ -1,4 +1,3 @@
-flask
+Flask
 gunicorn
 yt-dlp
-requests
